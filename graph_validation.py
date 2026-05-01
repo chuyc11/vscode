@@ -1,6 +1,6 @@
 from typing import List, Set, Dict
 from collections import defaultdict, deque
-from schema_draft import ClaimGraphDraft
+from schema import ClaimGraphDraft
 
 def validate_claim_dag(draft: ClaimGraphDraft) -> None:
     drafts = draft.drafts

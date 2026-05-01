@@ -2,8 +2,8 @@ import logging
 from pydantic import BaseModel, ConfigDict, Field
 from typing import Dict, Optional, List
 from schema import FactCard, ClaimGraph, AssassinationReport, FinalDecision, AttackFinding
-from schema_draft import ClaimGraphDraft
-from schema_views import build_fact_views_for_d
+from schema import ClaimGraphDraft, QuantFactCard, build_fact_views_for_d
+from agent_c_financial import enrich_financial_data_sync as enrich_financial_data
 from agent_d_strategist import generate_claim_graph_draft, repair_claim_graph_draft, reinforce_draft_after_attack
 from graph_validation import validate_claim_dag
 from graph_hydration import hydrate_claim_graph
@@ -19,6 +19,7 @@ class ResearchState(BaseModel):
     model_config = ConfigDict(extra="forbid")
     topic: str
     facts: Dict[str, FactCard]
+    quant_facts: List[QuantFactCard] = Field(default_factory=list)
     draft: Optional[ClaimGraphDraft] = None
     graph: Optional[ClaimGraph] = None
     report: Optional[AssassinationReport] = None
@@ -32,6 +33,16 @@ class ResearchState(BaseModel):
 
 def run_pipeline(topic: str, facts: Dict[str, FactCard]) -> ResearchState:
     state = ResearchState(topic=topic, facts=facts)
+
+    # === C phase: financial enrichment ===
+    logger.info("C phase: enriching financial data for topic '%s'", topic)
+    try:
+        state.quant_facts = enrich_financial_data(facts)
+        logger.info("C phase: %d QuantFactCards produced", len(state.quant_facts))
+    except Exception as e:
+        logger.warning("C phase failed (non-fatal): %s", e)
+        state.errors.append(e)
+
     fact_views = build_fact_views_for_d(facts)
 
     # === D phase: initial draft ===

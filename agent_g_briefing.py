@@ -1,29 +1,9 @@
 import logging
-import os
-from openai import OpenAI
 from typing import Dict, Any, List
 from schema import ClaimGraph, AttackStatus, AttackFinding
+from llm_client import call_llm
 
 logger = logging.getLogger(__name__)
-
-def _get_client() -> OpenAI:
-    api_key = os.getenv("NVIDIA_API_KEY")
-    if not api_key:
-        raise ValueError("NVIDIA_API_KEY not set")
-    return OpenAI(
-        base_url="https://integrate.api.nvidia.com/v1",
-        api_key=api_key
-    )
-
-_model = os.getenv("NIM_DEEP_MODEL", "meta/llama-3.1-70b-instruct")
-
-def _call_llm(messages: list) -> str:
-    client = _get_client()
-    response = client.chat.completions.create(
-        model=_model,
-        messages=messages,
-    )
-    return response.choices[0].message.content
 
 BRIEFING_SYSTEM_PROMPT = """你是一个高级情报分析官。你的任务是基于审查后的 claim 图谱和攻击分析结果，生成一份专业的情报简报。
 
@@ -140,7 +120,7 @@ def generate_briefing(topic: str, graph: ClaimGraph, attack_findings: List[Attac
 请基于以上数据生成一份完整的情报简报。"""
 
     try:
-        briefing = _call_llm([
+        briefing = call_llm([
             {"role": "system", "content": BRIEFING_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ])

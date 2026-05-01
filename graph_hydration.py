@@ -1,5 +1,5 @@
 from schema import ClaimGraph, ClaimNode, FactCard, make_id
-from schema_draft import ClaimGraphDraft
+from schema import ClaimGraphDraft
 from typing import Dict, List
 
 def hydrate_claim_graph(draft: ClaimGraphDraft, facts: Dict[str, FactCard]) -> ClaimGraph:

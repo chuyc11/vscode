@@ -1,31 +1,12 @@
 import logging
-import os
-from openai import OpenAI
-from schema_draft import ClaimGraphDraft, ClaimDraft
-from schema_views import FactCardViewForD
+import re  # used by _extract_keywords
+from schema import ClaimGraphDraft, ClaimDraft, FactCardViewForD
+from llm_client import call_llm_json
 from typing import List
 
 logger = logging.getLogger(__name__)
 
-def _get_client() -> OpenAI:
-    api_key = os.getenv("NVIDIA_API_KEY")
-    if not api_key:
-        raise ValueError("NVIDIA_API_KEY not set")
-    return OpenAI(
-        base_url="https://integrate.api.nvidia.com/v1",
-        api_key=api_key
-    )
-
-_model = os.getenv("NIM_DEEP_MODEL", "meta/llama-3.1-70b-instruct")
-
-def _call_llm(messages: list) -> str:
-    client = _get_client()
-    response = client.chat.completions.create(
-        model=_model,
-        messages=messages,
-        response_format={"type": "json_schema", "json_schema": {"name": "claim_graph_draft", "schema": ClaimGraphDraft.model_json_schema()}}
-    )
-    return response.choices[0].message.content
+_JSON_SCHEMA = {"name": "claim_graph_draft", "schema": ClaimGraphDraft.model_json_schema()}
 
 ANALYSIS_SYSTEM_PROMPT = """你是一个高级情报分析策略师。你的任务是基于事实数据构建结构化的论证图谱。
 
@@ -132,10 +113,10 @@ def generate_claim_graph_draft(fact_views: List[FactCardViewForD], topic: str) -
 - 每个 claim 至少引用 1 个事实 ID
 - reasoning 必须详细说明如何从事实推导到结论"""
 
-    json_str = _call_llm([
+    json_str = call_llm_json([
         {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
         {"role": "user", "content": prompt}
-    ])
+    ], _JSON_SCHEMA)
     draft = ClaimGraphDraft.model_validate_json(json_str)
     return _match_claims_to_facts(draft, fact_views)
 
@@ -157,10 +138,10 @@ def repair_claim_graph_draft(
 
 请修复并重新生成一个有效的 ClaimGraphDraft。fact_ids 必须使用上方的事实 ID。"""
 
-    json_str = _call_llm([
+    json_str = call_llm_json([
         {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
         {"role": "user", "content": prompt}
-    ])
+    ], _JSON_SCHEMA)
     draft = ClaimGraphDraft.model_validate_json(json_str)
     return _match_claims_to_facts(draft, fact_views)
 
@@ -197,9 +178,9 @@ def reinforce_draft_after_attack(
 
 返回修复后的 ClaimGraphDraft。"""
 
-    json_str = _call_llm([
+    json_str = call_llm_json([
         {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
         {"role": "user", "content": prompt}
-    ])
+    ], _JSON_SCHEMA)
     draft = ClaimGraphDraft.model_validate_json(json_str)
     return _match_claims_to_facts(draft, fact_views)

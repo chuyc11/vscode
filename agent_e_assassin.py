@@ -1,32 +1,12 @@
 import json
 import logging
-import os
-from openai import OpenAI
 from schema import (
     ClaimGraph, AssassinationReport, AttackFinding,
     AttackType, Severity, FinalDecision, ClaimType
 )
+from llm_client import call_llm
 
 logger = logging.getLogger(__name__)
-
-def _get_client() -> OpenAI:
-    api_key = os.getenv("NVIDIA_API_KEY")
-    if not api_key:
-        raise ValueError("NVIDIA_API_KEY not set")
-    return OpenAI(
-        base_url="https://integrate.api.nvidia.com/v1",
-        api_key=api_key
-    )
-
-_model = os.getenv("NIM_DEEP_MODEL", "meta/llama-3.1-70b-instruct")
-
-def _call_llm(messages: list) -> str:
-    client = _get_client()
-    response = client.chat.completions.create(
-        model=_model,
-        messages=messages,
-    )
-    return response.choices[0].message.content
 
 ATTACK_SYSTEM_PROMPT = """你是一个严格的情报审查专家（"刺客"）。你的任务是对每个 claim 进行深度语义攻击分析。
 
@@ -95,7 +75,7 @@ Claim [{node.claim_id}]:
 请逐个分析每个 claim，返回发现的问题列表（JSON 数组）。"""
 
     try:
-        raw = _call_llm([
+        raw = call_llm([
             {"role": "system", "content": ATTACK_SYSTEM_PROMPT},
             {"role": "user", "content": prompt}
         ])
