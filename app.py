@@ -16,6 +16,7 @@ st.markdown("**终极情报分析引擎 - Alpha 版** | 由 A-J 节点驱动")
 with st.sidebar:
     st.header("控制面板")
     query = st.text_input("输入课题 (query)", "OpenAI model Nvidia stock")
+    doc_dir = st.text_input("内参文档目录 (可选)", "", help="输入本地内参文档目录路径，支持 PDF/TXT/MD 格式")
     st.markdown("---")
     start_button = st.button("🚀 启动矩阵", type="primary")
 
@@ -33,7 +34,7 @@ if start_button:
     st.success(f"✅ 检索到 {len(facts)} 条事实数据（已通过相关性筛选）")
 
     with st.spinner("🧠 D-E-G 节点正在迭代分析..."):
-        state = run_pipeline(query, facts)
+        state = run_pipeline(query, facts, doc_dir=doc_dir.strip())
 
     st.success("🎯 推理完成！")
 

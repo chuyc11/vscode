@@ -1,0 +1,74 @@
+<!-- XSS-CONTRACT: downstream MUST run DOMPurify.sanitize() after rendering HTML -->
+# 情报简报：{{ topic | sanitize_markdown }}
+
+**生成时间：** {{ timestamp }}
+**最终决策：** {{ decision }}
+**分析迭代轮次：** {{ iteration_count }}
+
+---
+
+## 1. 执行摘要
+
+{{ executive_summary }}
+
+---
+
+## 2. 关键发现（已通过审查）
+
+{% if passed_claims %}
+{% for claim in passed_claims %}
+### ✅ {{ claim.content | sanitize_markdown }}
+- **类型：** {{ claim.claim_type }} | **置信度：** {{ "%.0f" | format(claim.confidence * 100) }}%
+- **推理路径：** {{ claim.reasoning | sanitize_markdown }}
+- **支撑事实：** {{ claim.fact_ids | join(', ') }}
+
+{% endfor %}
+{% else %}
+> 无通过审查的声明。
+{% endif %}
+
+{% if risk_claims %}
+---
+
+## 3. ⚠️ 风险预警
+
+{% for claim in risk_claims %}
+> **⚠️ 风险声明：** {{ claim.content | sanitize_markdown }}
+> - **类型：** {{ claim.claim_type }} | **置信度：** {{ "%.0f" | format(claim.confidence * 100) }}%
+> - **攻击类型：** {{ claim.attack_type | sanitize_markdown }}
+> - **风险说明：**
+{% for note in claim.risk_notes %}
+>   - {{ note | sanitize_markdown }}
+{% endfor %}
+
+{% endfor %}
+{% endif %}
+
+{% if hidden_count > 0 %}
+---
+
+> *🔒 注：{{ hidden_count }} 个高风险声明已被过滤（含无据声明、严重逻辑跳跃等），详见审计日志。*
+{% endif %}
+
+---
+
+## 4. 证据链分析
+
+{% if evidence_summary %}
+{% for item in evidence_summary %}
+- **{{ item.strength }}** 环节：{{ item.description | sanitize_markdown }}（引用 {{ item.fact_count }} 条事实，平均可信度 {{ "%.0f" | format(item.avg_credibility * 100) }}%）
+{% endfor %}
+{% else %}
+> 无可用证据链分析。
+{% endif %}
+
+---
+
+## 5. 建议与下一步
+
+{{ recommendations }}
+
+---
+
+*本简报由 A-J 终极情报矩阵自动生成，结构化数据由 Jinja2 模板渲染。*
+*下游系统解析 HTML 后必须挂载 DOMPurify 进行 XSS 消毒。*

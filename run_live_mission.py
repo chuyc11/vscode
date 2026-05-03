@@ -10,6 +10,7 @@ import pprint
 def main():
     parser = argparse.ArgumentParser(description="Run intelligence analysis pipeline")
     parser.add_argument("--query", "-q", type=str, default="OpenAI model Nvidia stock", help="Search query for the analysis")
+    parser.add_argument("--doc-dir", "-d", type=str, default="", help="Local internal document directory (PDF/TXT/MD)")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -29,7 +30,7 @@ def main():
     for fact in facts.values():
         print(f"- {fact.content[:100]}...")
 
-    state = run_pipeline(query, facts)
+    state = run_pipeline(query, facts, doc_dir=args.doc_dir.strip())
 
     print("\n=== Final State ===")
     print(f"Status: {state.status}")

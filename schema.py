@@ -89,6 +89,15 @@ class Entity(BaseModel):
     confidence: float = 1.0
 
 
+class SourceMetadata(BaseModel):
+    """知识溯源元数据 — 记录内参文档的出处信息。"""
+    model_config = ConfigDict(extra="forbid")
+    file_name: str
+    file_path: str = ""
+    page_number: Optional[int] = None
+    chunk_index: int = 0
+
+
 class FactCard(BaseModel):
     model_config = ConfigDict(extra="forbid")
     fact_id: str = Field(default_factory=make_id)
@@ -100,6 +109,7 @@ class FactCard(BaseModel):
     relevance_score: float = 0.5
     summary: str = ""
     entities: List[Entity] = Field(default_factory=list)
+    source_metadata: Optional[SourceMetadata] = None
 
 
 # ---------------------------------------------------------------------------
@@ -247,6 +257,22 @@ class QuantFactCard(BaseModel):
     fetch_timestamp: datetime = Field(default_factory=utc_now)
     fetch_success: bool = True
     fetch_errors: List[str] = Field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# FactCardBatch — batch serialization wrapper for Redis storage
+# ---------------------------------------------------------------------------
+
+class FactCardBatch(BaseModel):
+    """Batch wrapper for serializing a Dict[str, FactCard] to Redis."""
+    model_config = ConfigDict(extra="forbid")
+    facts: Dict[str, FactCard]
+
+
+class QuantFactCardBatch(BaseModel):
+    """Batch wrapper for serializing List[QuantFactCard] to Redis."""
+    model_config = ConfigDict(extra="forbid")
+    quant_facts: List["QuantFactCard"]
 
 
 def build_fact_views_for_d(facts: Dict[str, FactCard]) -> List[FactCardViewForD]:

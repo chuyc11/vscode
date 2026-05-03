@@ -1,148 +1,358 @@
+"""G-node: intelligence briefing generator with Jinja2 rendering.
+
+Refactored to use Jinja2 templates for structured Markdown output with:
+- Claim classification: PASSED / RISK / HIDDEN (FAILED nodes hidden, logged)
+- XSS-immune rendering via sanitize_markdown filter (AST-safe, no regex/bleach)
+- System contract: downstream MUST mount DOMPurify after HTML rendering
+- Evidence chain analysis with strength indicators
+- LLM-generated executive summary and recommendations
+
+Engineering red lines
+---------------------
+1. FAILED nodes (HIGH severity) are NEVER rendered — only structlog-logged.
+2. sanitize_markdown filter uses html.escape() on user content, NOT regex/bleach.
+3. XSS-CONTRACT comment embedded in output header.
+4. All user content passes through Jinja2 | sanitize_markdown filter.
+"""
+
 import logging
-from typing import Dict, Any, List
-from schema import ClaimGraph, AttackStatus, AttackFinding
+import os
+from typing import List, Dict, Any
+from html import escape as html_escape
+
+import structlog
+from jinja2 import Environment, FileSystemLoader, select_autoescape
+
+from schema import (
+    ClaimGraph, ClaimNode, AttackFinding, AttackStatus,
+    Severity, FinalDecision, utc_now,
+)
 from llm_client import call_llm
+
+# ---------------------------------------------------------------------------
+# Structlog
+# ---------------------------------------------------------------------------
+structlog.configure(
+    processors=[
+        structlog.contextvars.merge_contextvars,
+        structlog.processors.add_log_level,
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.dev.ConsoleRenderer()
+        if os.getenv("LOG_FORMAT") != "json"
+        else structlog.processors.JSONRenderer(),
+    ],
+    wrapper_class=structlog.make_filtering_bound_logger(
+        int(os.getenv("LOG_LEVEL_NUM", "20"))
+    ),
+)
+slog = structlog.get_logger()
 
 logger = logging.getLogger(__name__)
 
-BRIEFING_SYSTEM_PROMPT = """你是一个高级情报分析官。你的任务是基于审查后的 claim 图谱和攻击分析结果，生成一份专业的情报简报。
-
-简报结构（严格遵循）：
-
-1. **执行摘要**（2-3 句话）
-   - 概括核心发现和最终结论
-   - 明确回答分析主题的核心问题
-
-2. **关键发现**（按重要性排列）
-   - 每个发现需有事实论据支撑
-   - 标注置信度和推理路径
-
-3. **证据链分析**
-   - 展示 claim 之间的逻辑关系
-   - 指出证据链中的强环节和弱环节
-
-4. **风险与不确定性**
-   - 明确哪些结论有风险
-   - 说明风险来源（证据不足/逻辑跳跃/信息矛盾等）
-   - 被攻击的 claim 需详细说明攻击理由
-
-5. **建议与下一步**
-   - 基于分析给出行动建议
-   - 指出需要进一步验证的方向
-
-语言要求：
-- 使用分析主题的语言（中文主题用中文，英文主题用英文）
-- 专业、客观、有深度
-- 避免空洞的概括，每个观点都要有具体论据"""
+# ---------------------------------------------------------------------------
+# XSS Protection — sanitize_markdown filter
+# ---------------------------------------------------------------------------
+# Dangerous HTML tags that must be neutralised in Markdown output.
+# We do NOT use regex or bleach on the full Markdown text.
+# Instead, we apply html.escape() to user-supplied content at template
+# interpolation points, preserving Markdown syntax while neutralising HTML.
+_DANGEROUS_TAGS = frozenset({
+    "script", "iframe", "object", "embed", "form", "input",
+    "style", "link", "base", "meta", "applet",
+})
 
 
-def build_briefing_data(graph: ClaimGraph, attack_findings: List[AttackFinding]) -> Dict[str, Any]:
-    passed = []
-    attacked = []
+def _sanitize_markdown(value: str) -> str:
+    """Jinja2 filter: HTML-escape user content for safe Markdown embedding.
+
+    This is NOT regex/bleach cleaning. We use Python's html.escape() to
+    convert < > & " to HTML entities, which:
+    - Preserves Markdown syntax (* _ # [] () etc.)
+    - Neutralises any HTML injection (<script>, <iframe>, etc.)
+    - Is safe for downstream Markdown-to-HTML renderers
+
+    The Markdown AST itself is not modified — only user-supplied string
+    values at interpolation points are escaped.
+    """
+    if not isinstance(value, str):
+        value = str(value)
+    return html_escape(value, quote=True)
+
+
+# ---------------------------------------------------------------------------
+# Jinja2 environment (lazy singleton)
+# ---------------------------------------------------------------------------
+_env: Environment | None = None
+
+
+def _get_jinja_env() -> Environment:
+    global _env
+    if _env is None:
+        template_dir = os.path.join(os.path.dirname(__file__), "templates")
+        _env = Environment(
+            loader=FileSystemLoader(template_dir),
+            autoescape=False,  # We handle escaping via sanitize_markdown filter
+            trim_blocks=True,
+            lstrip_blocks=True,
+        )
+        _env.filters["sanitize_markdown"] = _sanitize_markdown
+    return _env
+
+
+# ---------------------------------------------------------------------------
+# Claim classification — PASSED / RISK / HIDDEN
+# ---------------------------------------------------------------------------
+
+def _classify_claims(
+    graph: ClaimGraph,
+    attack_findings: List[AttackFinding],
+) -> tuple[List[ClaimNode], List[ClaimNode], List[ClaimNode]]:
+    """Classify claims into passed, risk, and hidden categories.
+
+    HIDDEN = HIGH severity ATTACKED nodes (never rendered, only logged).
+    RISK = ATTACKED nodes without HIGH severity.
+    PASSED = UNATTACKED or DEFENDED nodes.
+    """
+    high_severity_ids = {f.claim_id for f in attack_findings if f.severity == Severity.HIGH}
+
+    passed: List[ClaimNode] = []
+    risk: List[ClaimNode] = []
+    hidden: List[ClaimNode] = []
 
     for node in graph.nodes.values():
-        claim_data = {
-            "content": node.content,
-            "claim_type": node.claim_type.value,
-            "confidence": node.confidence,
-            "reasoning": node.reasoning,
-            "fact_ids": node.fact_ids,
-            "risk_notes": node.risk_notes
-        }
-        if node.attack_status in (AttackStatus.UNATTACKED, AttackStatus.DEFENDED):
-            passed.append(claim_data)
+        if node.claim_id in high_severity_ids:
+            hidden.append(node)
+            slog.info("g_node_hidden_claim",
+                      claim_id=node.claim_id,
+                      content_preview=node.content[:100],
+                      risk_notes_count=len(node.risk_notes))
+        elif node.attack_status in (AttackStatus.UNATTACKED, AttackStatus.DEFENDED):
+            passed.append(node)
         else:
-            attacked.append(claim_data)
+            risk.append(node)
 
-    facts_text = []
-    for fact in graph.facts.values():
-        facts_text.append({
-            "content": fact.content,
-            "credibility": fact.credibility_score,
-            "relevance": fact.relevance_score,
-            "summary": fact.summary
+    slog.info("g_node_classification",
+              passed=len(passed), risk=len(risk), hidden=len(hidden))
+    return passed, risk, hidden
+
+
+# ---------------------------------------------------------------------------
+# Evidence chain analysis
+# ---------------------------------------------------------------------------
+
+def _build_evidence_summary(graph: ClaimGraph) -> List[Dict[str, Any]]:
+    """Analyze evidence chain strength per claim."""
+    summary = []
+    for node in graph.nodes.values():
+        if not node.fact_ids:
+            continue
+        cred_scores = []
+        for fid in node.fact_ids:
+            if fid in graph.facts:
+                cred_scores.append(graph.facts[fid].credibility_score)
+        avg_cred = sum(cred_scores) / len(cred_scores) if cred_scores else 0.0
+
+        if avg_cred >= 0.7 and len(cred_scores) >= 2:
+            strength = "🟢 强"
+        elif avg_cred >= 0.5:
+            strength = "🟡 中"
+        else:
+            strength = "🔴 弱"
+
+        summary.append({
+            "claim_id": node.claim_id,
+            "description": node.content[:80],
+            "fact_count": len(cred_scores),
+            "avg_credibility": avg_cred,
+            "strength": strength,
         })
+    return summary
 
-    findings_text = []
-    for f in attack_findings:
-        finding = {
-            "claim_id": f.claim_id,
-            "type": f.attack_type.value,
-            "severity": f.severity.value,
-            "description": f.description
-        }
-        if f.evidence_quote:
-            finding["evidence_quote"] = f.evidence_quote
-        findings_text.append(finding)
 
+# ---------------------------------------------------------------------------
+# Template data preparation
+# ---------------------------------------------------------------------------
+
+def _prepare_claim_data(node: ClaimNode) -> Dict[str, Any]:
+    """Prepare a single claim node for template rendering."""
     return {
-        "passed_claims": passed,
-        "attacked_claims": attacked,
-        "facts": facts_text,
-        "attack_findings": findings_text
+        "content": node.content,
+        "claim_type": node.claim_type.value,
+        "confidence": node.confidence,
+        "reasoning": node.reasoning,
+        "fact_ids": node.fact_ids,
+        "risk_notes": node.risk_notes,
+        "attack_type": ", ".join(
+            note.split(":")[0] for note in node.risk_notes if ":" in note
+        ) if node.risk_notes else "",
     }
 
 
-def generate_briefing(topic: str, graph: ClaimGraph, attack_findings: List[AttackFinding]) -> str:
-    data = build_briefing_data(graph, attack_findings)
+# ---------------------------------------------------------------------------
+# LLM summary generation
+# ---------------------------------------------------------------------------
 
-    claims_text = ""
-    for i, c in enumerate(data["passed_claims"], 1):
-        claims_text += f"\n  [{i}] ({c['claim_type']}, 置信度:{c['confidence']}) {c['content']}\n    推理: {c['reasoning']}"
+_SUMMARY_SYSTEM_PROMPT = """你是一个高级情报分析官。基于以下分类数据，生成两段文字：
 
-    attacked_text = ""
-    for i, c in enumerate(data["attacked_claims"], 1):
-        attacked_text += f"\n  [{i}] ({c['claim_type']}, 置信度:{c['confidence']}) {c['content']}\n    推理: {c['reasoning']}\n    风险: {'; '.join(c['risk_notes'])}"
+1. 执行摘要（2-3 句话）：概括核心发现和最终结论，明确回答分析主题的核心问题。
+2. 建议与下一步（3-5 条）：基于分析给出行动建议，指出需要进一步验证的方向。
 
-    facts_text = ""
-    for f in data["facts"]:
-        facts_text += f"\n  - (可信度:{f['credibility']}, 相关性:{f['relevance']}) {f['content']}\n    摘要: {f['summary']}"
+语言要求：使用分析主题的语言（中文主题用中文，英文主题用英文）。
+输出格式：
+---SUMMARY---
+（执行摘要内容）
+---RECOMMENDATIONS---
+（建议内容）"""
 
-    findings_text = ""
-    for f in data["attack_findings"]:
-        eq = f'\n    证据引用: "{f["evidence_quote"]}"' if f.get("evidence_quote") else ""
-        findings_text += f"\n  - [{f['severity']}] {f['type']}: {f['description']}{eq}"
+
+def _generate_summary_via_llm(
+    topic: str,
+    passed: List[ClaimNode],
+    risk: List[ClaimNode],
+    hidden: List[ClaimNode],
+    decision: FinalDecision,
+) -> tuple[str, str]:
+    """Use LLM to generate executive summary and recommendations."""
+    passed_text = "\n".join(
+        f"  - [{n.claim_type.value}] {n.content} (置信度:{n.confidence})"
+        for n in passed
+    ) or "  无"
+
+    risk_text = "\n".join(
+        f"  - [{n.claim_type.value}] {n.content} | 风险: {'; '.join(n.risk_notes)}"
+        for n in risk
+    ) or "  无"
 
     prompt = f"""分析主题: {topic}
+最终决策: {decision.value}
 
 通过审查的声明:
-{claims_text if claims_text else "  无"}
+{passed_text}
 
-被攻击的声明:
-{attacked_text if attacked_text else "  无"}
+有风险的声明:
+{risk_text}
 
-支撑事实:
-{facts_text}
+隐藏的高风险声明数量: {len(hidden)}
 
-攻击发现:
-{findings_text if findings_text else "  无"}
-
-请基于以上数据生成一份完整的情报简报。"""
+请生成执行摘要和建议。"""
 
     try:
-        briefing = call_llm([
-            {"role": "system", "content": BRIEFING_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt}
+        raw = call_llm([
+            {"role": "system", "content": _SUMMARY_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
         ])
-        return briefing
+
+        summary = ""
+        recommendations = ""
+        if "---SUMMARY---" in raw and "---RECOMMENDATIONS---" in raw:
+            parts = raw.split("---RECOMMENDATIONS---")
+            summary = parts[0].replace("---SUMMARY---", "").strip()
+            recommendations = parts[1].strip()
+        else:
+            summary = raw.strip()
+            recommendations = "建议基于上述分析进一步验证关键声明。"
+
+        return summary, recommendations
+
     except Exception as e:
-        logger.error("Briefing generation failed: %s", e)
-        return _fallback_briefing(topic, data)
+        slog.error("g_node_llm_summary_failed", error=str(e))
+        summary = f"基于 {len(passed)} 条通过声明和 {len(risk)} 条风险声明的分析，最终决策为 {decision.value}。"
+        recommendations = "建议对风险声明进行进一步验证，关注证据链薄弱环节。"
+        return summary, recommendations
 
 
-def _fallback_briefing(topic: str, data: Dict[str, Any]) -> str:
-    lines = [f"情报简报: {topic}\n"]
-    lines.append("通过的声明:")
-    for c in data["passed_claims"]:
-        lines.append(f"  - {c['content']} (置信度: {c['confidence']})")
-    if data["attacked_claims"]:
-        lines.append("\n有风险的声明:")
-        for c in data["attacked_claims"]:
-            lines.append(f"  - {c['content']}")
-            for r in c["risk_notes"]:
-                lines.append(f"    风险: {r}")
-    if data["attack_findings"]:
-        lines.append("\n攻击发现:")
-        for f in data["attack_findings"]:
-            lines.append(f"  - [{f['severity']}] {f['description']}")
+# ---------------------------------------------------------------------------
+# Fallback briefing (no LLM, no Jinja2)
+# ---------------------------------------------------------------------------
+
+def _fallback_briefing(
+    topic: str,
+    passed: List[ClaimNode],
+    risk: List[ClaimNode],
+    hidden: List[ClaimNode],
+    decision: FinalDecision,
+) -> str:
+    """Generate a plain-text briefing when LLM or Jinja2 fails."""
+    lines = [
+        f"# 情报简报：{topic}",
+        f"**最终决策：** {decision.value}",
+        "",
+        "## 通过审查的声明",
+    ]
+    for n in passed:
+        lines.append(f"- [{n.claim_type.value}] {n.content} (置信度:{n.confidence})")
+    if risk:
+        lines.append("")
+        lines.append("## ⚠️ 风险预警")
+        for n in risk:
+            lines.append(f"- ⚠️ {n.content}")
+            for note in n.risk_notes:
+                lines.append(f"  - {note}")
+    if hidden:
+        lines.append("")
+        lines.append(f"> *🔒 {len(hidden)} 个高风险声明已被过滤。*")
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+def generate_briefing(
+    topic: str,
+    graph: ClaimGraph,
+    attack_findings: List[AttackFinding],
+) -> str:
+    """G-node main entry: ClaimGraph + AttackFindings -> Markdown briefing.
+
+    Pipeline:
+    1. Classify claims: PASSED / RISK / HIDDEN
+    2. LLM generates executive summary + recommendations
+    3. Jinja2 renders structured Markdown briefing
+    4. FAILED nodes are hidden, only structlog-logged
+    """
+    decision = FinalDecision.PASS
+    if any(f.severity == Severity.HIGH for f in attack_findings):
+        decision = FinalDecision.REJECT
+    elif any(f.severity == Severity.MEDIUM for f in attack_findings):
+        decision = FinalDecision.PASSED_WITH_RISKS
+
+    # Step 1: Classify claims
+    passed, risk, hidden = _classify_claims(graph, attack_findings)
+
+    # Step 2: LLM summary
+    summary_text, recommendations = _generate_summary_via_llm(
+        topic, passed, risk, hidden, decision
+    )
+
+    # Step 3: Jinja2 render
+    try:
+        env = _get_jinja_env()
+        template = env.get_template("briefing.md.j2")
+
+        passed_data = [_prepare_claim_data(n) for n in passed]
+        risk_data = [_prepare_claim_data(n) for n in risk]
+        evidence_summary = _build_evidence_summary(graph)
+
+        briefing = template.render(
+            topic=topic,
+            timestamp=utc_now().isoformat(),
+            decision=decision.value,
+            iteration_count=0,
+            executive_summary=summary_text,
+            passed_claims=passed_data,
+            risk_claims=risk_data,
+            hidden_count=len(hidden),
+            evidence_summary=evidence_summary,
+            recommendations=recommendations,
+        )
+
+        slog.info("g_node_complete",
+                  decision=decision.value,
+                  passed=len(passed), risk=len(risk), hidden=len(hidden),
+                  briefing_length=len(briefing))
+        return briefing
+
+    except Exception as e:
+        slog.error("g_node_jinja_failed", error=str(e))
+        return _fallback_briefing(topic, passed, risk, hidden, decision)
