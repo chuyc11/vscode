@@ -1,18 +1,10 @@
-"""A-node: concurrent web retriever with domain circuit breaker.
+"""A-node: Tavily-powered web retriever.
 
-Pipeline: sub-query generation → concurrent DuckDuckGo search → URL
-normalization & dedup → concurrent BeautifulSoup scrape (with Playwright
-fallback gated by domain-level circuit breaker) → SimHash content dedup
-→ batched LLM scoring → FactCard assembly.
+Pipeline: sub-query generation → concurrent Tavily search (advanced depth)
+→ SimHash content dedup → batched LLM scoring → FactCard assembly.
 
-Engineering red lines
----------------------
-1. Domain-level circuit breaker: if a domain's Playwright fallback rate
-   exceeds CB_THRESHOLD within CB_WINDOW seconds, new Playwright instances
-   for that domain are rejected (prevents OOM).
-2. All底层 I/O is async-safe (aiohttp, asyncio.to_thread for sync calls).
-3. Circuit breaker events are logged via structlog with a per-pipeline
-   Trace ID for full observability.
+Tavily returns cleaned content directly, eliminating the need for
+BeautifulSoup scraping, Playwright fallback, and domain circuit breakers.
 """
 
 import asyncio
@@ -25,12 +17,10 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+from urllib.parse import urlparse
 
-import aiohttp
 import structlog
-from bs4 import BeautifulSoup, Tag
-from ddgs import DDGS
+from tavily import TavilyClient
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -42,8 +32,45 @@ from tenacity import (
 from schema import FactCard, SourceTier, EvidenceType, make_id, utc_now
 from llm_client import call_llm
 
+
 # ---------------------------------------------------------------------------
-# Structlog configuration (JSON output with Trace ID injection)
+# RawItem — kept for backward compatibility with B-node
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RawItem:
+    """Normalised search result before FactCard conversion."""
+    url: str
+    domain: str
+    title: str
+    body: str
+    snippet: str
+    source_query: str
+    used_playwright: bool = False
+    timestamp: float = field(default_factory=time.time)
+
+
+# ---------------------------------------------------------------------------
+# DomainCircuitBreaker — stub for backward compatibility with tests
+# ---------------------------------------------------------------------------
+
+class DomainCircuitBreaker:
+    """Stub: Tavily does not need a circuit breaker."""
+
+    def __init__(self):
+        self._history: dict[str, list[tuple[float, bool]]] = {}
+
+    def record(self, domain: str, was_fallback: bool) -> None:
+        pass
+
+    def is_open(self, domain: str) -> bool:
+        return False
+
+    def get_stats(self, domain: str) -> dict:
+        return {"domain": domain, "total": 0, "fallbacks": 0, "rate": 0.0, "circuit_open": False}
+
+# ---------------------------------------------------------------------------
+# Structlog configuration
 # ---------------------------------------------------------------------------
 structlog.configure(
     processors=[
@@ -60,168 +87,54 @@ structlog.configure(
 slog = structlog.get_logger()
 
 # ---------------------------------------------------------------------------
-# Configuration (env-overridable)
+# Configuration
 # ---------------------------------------------------------------------------
-MAX_CONCURRENT_SCRAPES = int(os.getenv("A_NODE_MAX_SCRAPES", "10"))
 MAX_CONCURRENT_SEARCHES = int(os.getenv("A_NODE_MAX_SEARCHES", "5"))
-NUM_SUB_QUERIES = int(os.getenv("A_NODE_SUB_QUERIES", "3"))
-SCRAPE_TIMEOUT = int(os.getenv("A_NODE_SCRAPE_TIMEOUT", "8"))
-MIN_CONTENT_LENGTH = 100
-SIMHASH_DISTANCE_THRESHOLD = 3
+NUM_SUB_QUERIES = int(os.getenv("A_NODE_SUB_QUERIES", "10"))
 SCORE_BATCH_SIZE = 10
-MIN_RELEVANCE_THRESHOLD = 0.5
+MIN_RELEVANCE_THRESHOLD = 0.4
+SIMHASH_DISTANCE_THRESHOLD = 3
 
-# Playwright fallback
-PLAYWRIGHT_TIMEOUT = int(os.getenv("A_NODE_PW_TIMEOUT", "15"))
-ENABLE_PLAYWRIGHT = os.getenv("A_NODE_ENABLE_PLAYWRIGHT", "0") == "1"
+HEURISTIC_SUFFIXES = [
+    "latest news",
+    "analysis report",
+    "expert opinion",
+    "background context",
+    "impact assessment",
+    "historical perspective",
+    "stakeholder reactions",
+    "data statistics",
+    "regional implications",
+    "future outlook",
+]
 
-# Circuit breaker thresholds
-CB_WINDOW = int(os.getenv("A_NODE_CB_WINDOW", "300"))  # seconds
-CB_THRESHOLD = float(os.getenv("A_NODE_CB_THRESHOLD", "0.5"))  # 50% fallback rate
-CB_MIN_CALLS = int(os.getenv("A_NODE_CB_MIN_CALLS", "3"))  # min attempts before tripping
-
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/128.0.0.0 Safari/537.36"
-)
-HEURISTIC_SUFFIXES = ["latest news", "analysis report", "expert opinion"]
-TRACKING_PARAMS = {
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-    "utm_id", "utm_cid", "fbclid", "gclid", "msclkid", "ref", "ref_",
-    "source", "spm", "from", "isappinstalled", "mc_cid", "mc_eid",
-}
-
-
-# ---------------------------------------------------------------------------
-# RawItem — normalized intermediate output
-# ---------------------------------------------------------------------------
-
-@dataclass
-class RawItem:
-    """Normalised scrape result before FactCard conversion."""
-    url: str
-    domain: str
-    title: str
-    body: str
-    snippet: str
-    source_query: str
-    used_playwright: bool = False
-    timestamp: float = field(default_factory=time.time)
-
+# Noise patterns commonly found in Tavily-extracted web content
+_NOISE_PATTERNS = [
+    r"^(logo|menu|search|login|sign up|subscribe|home|about|contact)\s*",
+    r"(analytics|cookie|privacy|terms|广告|备案|京ICP|Copyright)\S*",
+    r"(无障碍链接|关注我们|旗下|PLUS|首页|导航)\s*",
+    r"#{1,6}\s*(无障碍链接|关注我们|导航|菜单|侧边栏)\s*",
+    r"^[#\s]*site\s*$",
+    r"^[\s\-_|/\\]+$",  # separator lines
+    r"^\s*\d+\s*KB\s*/\s*\d+",  # progress bars
+    r"(facebook|twitter|instagram|weibo|wechat)\s*(icon|logo)?\s*$",
+]
+_NOISE_RE = re.compile("|".join(_NOISE_PATTERNS), re.IGNORECASE | re.MULTILINE)
 
 # ---------------------------------------------------------------------------
-# Domain-level Circuit Breaker
+# Tavily client (singleton)
 # ---------------------------------------------------------------------------
-
-class DomainCircuitBreaker:
-    """Track per-domain Playwright fallback rates and block when excessive.
-
-    Prevents OOM by refusing to launch new Playwright browser instances
-    for domains that consistently require fallback (indicating anti-bot
-    protection or heavy JS rendering).
-    """
-
-    def __init__(self):
-        # domain -> list of (timestamp, was_fallback)
-        self._history: dict[str, list[tuple[float, bool]]] = {}
-
-    def record(self, domain: str, was_fallback: bool) -> None:
-        now = time.time()
-        if domain not in self._history:
-            self._history[domain] = []
-        self._history[domain].append((now, was_fallback))
-        # Prune old entries outside the window
-        cutoff = now - CB_WINDOW
-        self._history[domain] = [
-            (t, f) for t, f in self._history[domain] if t >= cutoff
-        ]
-
-    def is_open(self, domain: str) -> bool:
-        """Return True if the circuit is open (block Playwright for this domain)."""
-        entries = self._history.get(domain, [])
-        if len(entries) < CB_MIN_CALLS:
-            return False
-        fallback_count = sum(1 for _, f in entries if f)
-        rate = fallback_count / len(entries)
-        return rate >= CB_THRESHOLD
-
-    def get_stats(self, domain: str) -> dict:
-        entries = self._history.get(domain, [])
-        fallback_count = sum(1 for _, f in entries if f)
-        return {
-            "domain": domain,
-            "total": len(entries),
-            "fallbacks": fallback_count,
-            "rate": fallback_count / len(entries) if entries else 0.0,
-            "circuit_open": self.is_open(domain),
-        }
+_tavily: TavilyClient | None = None
 
 
-_cb = DomainCircuitBreaker()
-
-
-# ---------------------------------------------------------------------------
-# URL Normalization
-# ---------------------------------------------------------------------------
-
-def _normalize_url(url: str) -> Optional[str]:
-    try:
-        parsed = urlparse(url)
-    except Exception:
-        return None
-    if parsed.scheme not in ("http", "https"):
-        return None
-    scheme = parsed.scheme.lower()
-    hostname = (parsed.hostname or "").lower()
-    if not hostname:
-        return None
-    port = parsed.port
-    if (scheme == "http" and port == 80) or (scheme == "https" and port == 443):
-        port = None
-    netloc = hostname if port is None else f"{hostname}:{port}"
-    path = parsed.path.rstrip("/") or "/"
-    query_params = parse_qs(parsed.query, keep_blank_values=True)
-    cleaned = {k: v for k, v in query_params.items() if k.lower() not in TRACKING_PARAMS}
-    query = urlencode(cleaned, doseq=True)
-    return urlunparse((scheme, netloc, path, "", query, ""))
-
-
-def _extract_domain(url: str) -> str:
-    try:
-        return (urlparse(url).hostname or "").lower()
-    except Exception:
-        return ""
-
-
-# ---------------------------------------------------------------------------
-# HTML Content Cleaning
-# ---------------------------------------------------------------------------
-
-_DISALLOWED_TAGS = {
-    "script", "style", "footer", "header", "nav", "menu",
-    "sidebar", "svg", "noscript", "iframe", "form",
-}
-_DISALLOWED_CLASSES = {
-    "nav", "menu", "sidebar", "footer", "ad", "advertisement", "cookie-banner",
-}
-
-
-def _clean_html(html: str) -> str:
-    soup = BeautifulSoup(html, "lxml")
-    for tag in soup.find_all(_DISALLOWED_TAGS):
-        tag.decompose()
-
-    def _has_disallowed_class(elem) -> bool:
-        if not isinstance(elem, Tag):
-            return False
-        return any(cls in _DISALLOWED_CLASSES for cls in elem.get("class", []))
-
-    for tag in soup.find_all(_has_disallowed_class):
-        tag.decompose()
-    text = soup.get_text(strip=True, separator="\n")
-    text = re.sub(r"\s{2,}", " ", text)
-    return text.strip()
+def _get_tavily() -> TavilyClient:
+    global _tavily
+    if _tavily is None:
+        api_key = os.getenv("TAVILY_API_KEY", "")
+        if not api_key:
+            raise ValueError("TAVILY_API_KEY not set")
+        _tavily = TavilyClient(api_key=api_key)
+    return _tavily
 
 
 # ---------------------------------------------------------------------------
@@ -269,11 +182,15 @@ def _is_near_duplicate(text: str, seen_hashes: list[int]) -> bool:
 # ---------------------------------------------------------------------------
 
 async def _generate_sub_queries(trace_id: str, query: str) -> list[str]:
-    prompt = f"""你是一个搜索策略专家。请为以下分析主题生成 {NUM_SUB_QUERIES} 个不同角度的搜索关键词。
+    prompt = f"""你是一个情报搜索策略专家。请为以下分析主题生成 {NUM_SUB_QUERIES} 个搜索关键词，覆盖尽可能多的信息维度。
 
 主题: {query}
 
-要求：每个关键词从不同维度切入。只返回 JSON 数组。"""
+要求：
+- 每个关键词必须从不同维度切入（如：事实报道、专家分析、历史背景、利益相关方反应、数据统计、区域影响等）
+- 中英文混合搜索（部分关键词用英文可以获取更多国际视角）
+- 避免关键词之间的重叠
+- 只返回 JSON 数组，不要其他内容"""
 
     try:
         raw = await asyncio.to_thread(
@@ -298,7 +215,7 @@ async def _generate_sub_queries(trace_id: str, query: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# Concurrent Search (DuckDuckGo)
+# Tavily Search
 # ---------------------------------------------------------------------------
 
 @retry(
@@ -308,9 +225,17 @@ async def _generate_sub_queries(trace_id: str, query: str) -> list[str]:
     before_sleep=before_sleep_log(logging.getLogger(__name__), logging.WARNING),
     reraise=True,
 )
-def _search_raw(query: str, max_results: int) -> list[dict]:
-    with DDGS() as ddgs:
-        return ddgs.text(query, max_results=max_results)
+def _tavily_search_raw(query: str, max_results: int) -> list[dict]:
+    client = _get_tavily()
+    # Always fetch at least 8 results per sub-query for breadth
+    per_query = max(max_results, 8)
+    response = client.search(
+        query=query,
+        search_depth="advanced",
+        max_results=per_query,
+        include_answer=False,
+    )
+    return response.get("results", [])
 
 
 async def _search_sub_query(
@@ -318,9 +243,9 @@ async def _search_sub_query(
 ) -> list[dict]:
     async with semaphore:
         try:
-            return await asyncio.to_thread(_search_raw, query, max_results)
+            return await asyncio.to_thread(_tavily_search_raw, query, max_results)
         except Exception as e:
-            slog.warning("search_failed", query=query[:60], error=str(e))
+            slog.warning("tavily_search_failed", query=query[:60], error=str(e))
             return []
 
 
@@ -331,132 +256,18 @@ async def _concurrent_search(
     results = await asyncio.gather(
         *[_search_sub_query(q, max_results, semaphore) for q in queries]
     )
+    # Deduplicate by URL
     seen_urls: set[str] = set()
     deduped: list[dict] = []
     for batch in results:
         for item in batch:
-            href = item.get("href", "")
-            norm = _normalize_url(href)
-            if norm and norm not in seen_urls:
-                seen_urls.add(norm)
-                item["_norm_url"] = norm
+            url = item.get("url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
                 deduped.append(item)
     total = sum(len(b) for b in results)
-    slog.info("search_complete", trace_id=trace_id, raw=total, unique=len(deduped))
+    slog.info("tavily_search_complete", trace_id=trace_id, raw=total, unique=len(deduped))
     return deduped
-
-
-# ---------------------------------------------------------------------------
-# Playwright Fallback (async, circuit-breaker gated)
-# ---------------------------------------------------------------------------
-
-async def _playwright_scrape(url: str, domain: str, trace_id: str) -> Optional[str]:
-    """Scrape a JS-heavy page with Playwright. Returns cleaned text or None."""
-    if not ENABLE_PLAYWRIGHT:
-        return None
-    if _cb.is_open(domain):
-        slog.warning("circuit_breaker_blocked",
-                      trace_id=trace_id, domain=domain,
-                      stats=_cb.get_stats(domain))
-        return None
-    try:
-        from playwright.async_api import async_playwright
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(url, timeout=PLAYWRIGHT_TIMEOUT * 1000, wait_until="domcontentloaded")
-            html = await page.content()
-            await browser.close()
-        body = _clean_html(html)
-        _cb.record(domain, was_fallback=False)
-        return body if len(body) >= MIN_CONTENT_LENGTH else None
-    except Exception as e:
-        _cb.record(domain, was_fallback=True)
-        slog.warning("playwright_fallback_failed",
-                      trace_id=trace_id, domain=domain, error=str(e),
-                      stats=_cb.get_stats(domain))
-        return None
-
-
-# ---------------------------------------------------------------------------
-# Concurrent Scraping (aiohttp + BeautifulSoup, Playwright fallback)
-# ---------------------------------------------------------------------------
-
-async def _scrape_url(
-    url: str,
-    domain: str,
-    snippet: str,
-    source_query: str,
-    session: aiohttp.ClientSession,
-    semaphore: asyncio.Semaphore,
-    trace_id: str,
-) -> Optional[RawItem]:
-    async with semaphore:
-        # Phase 1: BeautifulSoup
-        try:
-            timeout = aiohttp.ClientTimeout(total=SCRAPE_TIMEOUT)
-            async with session.get(url, timeout=timeout, headers={"User-Agent": USER_AGENT}) as resp:
-                if resp.status != 200:
-                    raise ValueError(f"HTTP {resp.status}")
-                html = await resp.text(errors="replace")
-            body = _clean_html(html)
-            if len(body) >= MIN_CONTENT_LENGTH:
-                soup = BeautifulSoup(html, "lxml")
-                title = soup.title.string.strip() if soup.title and soup.title.string else ""
-                return RawItem(
-                    url=url, domain=domain, title=title, body=body,
-                    snippet=snippet, source_query=source_query,
-                    used_playwright=False,
-                )
-        except Exception as e:
-            slog.debug("bs4_scrape_failed", trace_id=trace_id, domain=domain, error=str(e))
-
-        # Phase 2: Playwright fallback (circuit-breaker gated)
-        pw_body = await _playwright_scrape(url, domain, trace_id)
-        if pw_body:
-            return RawItem(
-                url=url, domain=domain, title="", body=pw_body,
-                snippet=snippet, source_query=source_query,
-                used_playwright=True,
-            )
-
-        # Phase 3: Fall back to snippet
-        if snippet and len(snippet) >= MIN_CONTENT_LENGTH:
-            return RawItem(
-                url=url, domain=domain, title="", body=snippet,
-                snippet=snippet, source_query=source_query,
-                used_playwright=False,
-            )
-        return None
-
-
-async def _concurrent_scrape(
-    trace_id: str, search_results: list[dict]
-) -> list[RawItem]:
-    if not search_results:
-        return []
-    connector = aiohttp.TCPConnector(limit=MAX_CONCURRENT_SCRAPES)
-    semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCRAPES)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        tasks = [
-            _scrape_url(
-                url=item.get("href", ""),
-                domain=_extract_domain(item.get("href", "")),
-                snippet=item.get("body", ""),
-                source_query=item.get("_source_query", ""),
-                session=session,
-                semaphore=semaphore,
-                trace_id=trace_id,
-            )
-            for item in search_results
-            if item.get("href")
-        ]
-        results = await asyncio.gather(*tasks)
-    items = [r for r in results if r is not None]
-    pw_count = sum(1 for r in items if r.used_playwright)
-    slog.info("scrape_complete", trace_id=trace_id,
-              success=len(items), total=len(tasks), playwright_used=pw_count)
-    return items
 
 
 # ---------------------------------------------------------------------------
@@ -488,10 +299,10 @@ def _score_batch_sync(topic: str, items_text: str) -> list[dict]:
 
 
 async def _score_batch(
-    trace_id: str, topic: str, items: list[RawItem], batch_offset: int
+    trace_id: str, topic: str, items: list[dict], batch_offset: int
 ) -> list[dict]:
     items_text = "\n".join(
-        f"[{batch_offset + i}] {it.title}: {it.body[:300]}"
+        f"[{batch_offset + i}] {_clean_content(it.get('title', ''))}: {_clean_content(it.get('content', ''))[:300]}"
         for i, it in enumerate(items)
     )
     indices = list(range(batch_offset, batch_offset + len(items)))
@@ -507,7 +318,7 @@ async def _score_batch(
 
 
 async def _score_all(
-    trace_id: str, topic: str, items: list[RawItem]
+    trace_id: str, topic: str, items: list[dict]
 ) -> list[dict]:
     if not items:
         return []
@@ -528,11 +339,40 @@ async def _score_all(
 
 
 # ---------------------------------------------------------------------------
+# Content Cleaning
+# ---------------------------------------------------------------------------
+
+def _clean_content(text: str) -> str:
+    """Remove HTML artifacts, navigation noise, and boilerplate from Tavily content."""
+    if not text:
+        return text
+    # Strip HTML tags
+    text = re.sub(r"<[^>]+>", " ", text)
+    # Remove noise patterns line by line
+    lines = text.split("\n")
+    cleaned = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        if _NOISE_RE.search(line):
+            continue
+        # Skip very short lines that are likely navigation fragments
+        if len(line) < 3 and not line.isdigit():
+            continue
+        cleaned.append(line)
+    result = "\n".join(cleaned)
+    # Collapse multiple spaces
+    result = re.sub(r"[ \t]{2,}", " ", result)
+    return result.strip()
+
+
+# ---------------------------------------------------------------------------
 # FactCard Assembly
 # ---------------------------------------------------------------------------
 
 def _build_fact_cards(
-    items: list[RawItem], scores: list[dict], max_results: int
+    items: list[dict], scores: list[dict], max_results: int
 ) -> list[FactCard]:
     score_map = {s["index"]: s for s in scores}
     facts: list[FactCard] = []
@@ -540,12 +380,16 @@ def _build_fact_cards(
         s = score_map.get(i)
         if not s:
             continue
-        body = item.body[:500] + "..." if len(item.body) > 500 else item.body
-        content = f"{item.title}: {body}" if item.title else body
+        content = _clean_content(item.get("content", ""))
+        title = _clean_content(item.get("title", ""))
+        if title:
+            content = f"{title}: {content}"
+        if len(content) < 50:
+            continue  # skip too-short results after cleaning
         facts.append(
             FactCard(
                 fact_id=make_id(),
-                content=content,
+                content=content[:500],
                 source_tier=SourceTier.SECONDARY,
                 evidence_type=EvidenceType.DOCUMENT,
                 timestamp=utc_now(),
@@ -594,38 +438,29 @@ async def _async_pipeline(query: str, max_results: int) -> list[FactCard]:
     # 1. Generate sub-queries
     sub_queries = await _generate_sub_queries(trace_id, query)
 
-    # 2. Concurrent search
+    # 2. Concurrent Tavily search (returns content directly)
     search_results = await _concurrent_search(trace_id, sub_queries, max_results)
     if not search_results:
         slog.warning("no_search_results", trace_id=trace_id)
         return _make_fallback_facts()
 
-    # Tag source query for traceability
-    for item in search_results:
-        item["_source_query"] = query
-
-    # 3. Concurrent scrape (BS4 + Playwright fallback with circuit breaker)
-    raw_items = await _concurrent_scrape(trace_id, search_results)
-    if not raw_items:
-        slog.warning("no_scraped_content", trace_id=trace_id)
-        return _make_fallback_facts()
-
-    # 4. Content-level SimHash dedup
+    # 3. Content-level SimHash dedup
     seen_hashes: list[int] = []
-    deduped: list[RawItem] = []
-    for item in raw_items:
-        if not _is_near_duplicate(item.body, seen_hashes):
+    deduped: list[dict] = []
+    for item in search_results:
+        content = item.get("content", "")
+        if content and not _is_near_duplicate(content, seen_hashes):
             deduped.append(item)
     slog.info("content_dedup", trace_id=trace_id,
-              before=len(raw_items), after=len(deduped))
+              before=len(search_results), after=len(deduped))
 
-    # 5. Batch LLM scoring
+    # 4. Batch LLM scoring
     scores = await _score_all(trace_id, query, deduped)
     if not scores:
         slog.warning("no_scores", trace_id=trace_id)
         return _make_fallback_facts()
 
-    # 6. Build FactCards
+    # 5. Build FactCards
     facts = _build_fact_cards(deduped, scores, max_results)
     if not facts:
         slog.warning("no_factcards", trace_id=trace_id)
@@ -636,11 +471,11 @@ async def _async_pipeline(query: str, max_results: int) -> list[FactCard]:
 
 
 # ---------------------------------------------------------------------------
-# Public Entry Point (synchronous, preserves original interface)
+# Public Entry Point
 # ---------------------------------------------------------------------------
 
 def search_real_news(query: str, max_results: int = 5) -> list[FactCard]:
-    """Search the web, scrape full pages, score with LLM, and return FactCards."""
+    """Search the web via Tavily, score with LLM, and return FactCards."""
     try:
         return asyncio.run(_async_pipeline(query, max_results))
     except Exception as e:

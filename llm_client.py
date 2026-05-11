@@ -31,11 +31,11 @@ from tenacity import (
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (read lazily so load_dotenv() has time to run)
 # ---------------------------------------------------------------------------
-_base_url = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
-_api_key = os.getenv("NVIDIA_API_KEY", "")
-_model = os.getenv("NIM_DEEP_MODEL", "meta/llama-3.1-70b-instruct")
+_base_url: str | None = None
+_api_key: str | None = None
+_model: str | None = None
 
 # ---------------------------------------------------------------------------
 # Singleton client (created lazily on first call)
@@ -44,8 +44,12 @@ _client: openai.OpenAI | None = None
 
 
 def _get_client() -> openai.OpenAI:
-    global _client
+    global _client, _base_url, _api_key, _model
     if _client is None:
+        if _api_key is None:
+            _base_url = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+            _api_key = os.getenv("NVIDIA_API_KEY", "")
+            _model = os.getenv("NIM_DEEP_MODEL", "meta/llama-3.1-70b-instruct")
         if not _api_key:
             raise ValueError("NVIDIA_API_KEY not set")
         _client = openai.OpenAI(base_url=_base_url, api_key=_api_key)
