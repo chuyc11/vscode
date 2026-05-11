@@ -64,23 +64,23 @@ MIN_TEXT_LENGTH = 50
 
 # Patterns that indicate prompt injection attempts
 _INJECTION_PATTERNS = [
-    # Direct instruction overrides
+    # Direct instruction overrides (English)
     r"(?i)\bignore\s+(all\s+)?(previous|above|prior)\s+(instructions?|prompts?|rules?)\b",
     r"(?i)\bdisregard\s+(all\s+)?(previous|above|prior)\s+(instructions?|prompts?)\b",
     r"(?i)\bforget\s+(all\s+)?(previous|above|prior)\s+(instructions?|prompts?)\b",
-    # Role hijacking
+    # Role hijacking (English)
     r"(?i)\byou\s+are\s+now\s+(a|an|the)\b",
     r"(?i)\bact\s+as\s+(a|an|the)\b",
     r"(?i)\bpretend\s+(you\s+)?(are|to\s+be)\b",
     r"(?i)\bnew\s+persona\b",
     r"(?i)\bsystem\s*:\s*you\s+are\b",
-    # Prompt leaking
-    r"(?i)\b(show|reveal|print|output|repeat)\s+(your|the|system)\s+(prompt|instructions?|rules?)\b",
+    # Prompt leaking (English)
+    r"(?i)\b(show|reveal|print|output|repeat)\s+(your|the|system)\s+(system\s+)?(prompt|instructions?|rules?)\b",
     r"(?i)\bwhat\s+(are|is)\s+your\s+(system\s+)?(prompt|instructions?|rules?)\b",
     # Encoded/obfuscated instructions
     r"(?i)\b(base64|rot13|hex)\s*(decode|encode)\b",
     r"(?i)\b\\x[0-9a-fA-F]{2}",
-    # Delimiter injection
+    # Delimiter injection (ChatML / Llama / custom)
     r"(?i)```[\s]*system[\s]*```",
     r"(?i)<\|im_start\|>",
     r"(?i)<\|im_end\|>",
@@ -90,6 +90,21 @@ _INJECTION_PATTERNS = [
     r"(?i)\bdo\s+anything\s+now\b",
     r"(?i)\bjailbreak\b",
     r"(?i)\bDAN\s+mode\b",
+    # ── Chinese injection patterns ──
+    # 指令覆盖: 忽略以上内容 / 忽略以上所有内容 / 忽略先前指令 / 忽略所有规则
+    r"忽略.{0,8}(以上|先前|之前|所有|全部).{0,8}(内容|指令|提示|规则|信息)",
+    # 角色劫持: 你现在是 / 假装你是 / 你的新角色
+    r"你(现在|的新角色)是",
+    r"假装(你是|你为)",
+    # 系统指令标签: 系统指令：/ 【系统指令】/ <<系统指令>> / 系统：
+    r"[【《<＜]?(系统|system)[\s]*(指令|提示|消息|命令)[】》>＞]?\s*[:：]",
+    r"[【《<＜](系统|system)[\s]*(指令|提示|消息|命令)[】》>＞]",
+    r"(系统|system)\s*[:：]",
+    # 数据操纵: 映射为 / 替换为 / 清空所有数据
+    r"(将|把).{0,20}(映射|替换|修改|篡改)为",
+    r"清空(所有|全部|全部)?(数据|内容|记录|信息)",
+    # Prompt 泄露 (中文): 显示你的系统指令 / 输出系统提示
+    r"(显示|输出|打印|泄露).{0,6}(指令|提示|规则|prompt|系统指令|系统提示)",
 ]
 _INJECTION_RE = [re.compile(p) for p in _INJECTION_PATTERNS]
 
@@ -108,18 +123,16 @@ def sanitize_text(text: str) -> tuple[str, bool]:
 
     detected = False
 
+    # Strip steganography characters FIRST so pattern matching sees clean text
+    text = _CONTROL_CHARS_RE.sub("", text)
+    text = _ZERO_WIDTH_RE.sub("", text)
+
     # Check for injection patterns
     for pattern in _INJECTION_RE:
         if pattern.search(text):
             detected = True
             # Neutralise the matched region by replacing with [REDACTED]
             text = pattern.sub("[SANITIZED]", text)
-
-    # Strip control characters
-    text = _CONTROL_CHARS_RE.sub("", text)
-
-    # Strip zero-width characters (used for steganography)
-    text = _ZERO_WIDTH_RE.sub("", text)
 
     # Collapse excessive whitespace (some attacks use huge whitespace)
     text = re.sub(r"\s{10,}", " ", text)
